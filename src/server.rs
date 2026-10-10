@@ -20,7 +20,8 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, fork, setsid};
 
 use crate::proto::{self, Msg};
-use crate::pty;
+use crate::vt::{Parser, Screen};
+use crate::{pty, render};
 
 /// What to run in the session's pty.
 pub struct Command {
@@ -93,6 +94,8 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
     ];
     let pty = pty::spawn(&cmd.path, &cmd.argv, &env, &ws)?;
     let mut master = File::from(pty.master);
+    let mut screen = Screen::new(ws.ws_row.into(), ws.ws_col.into());
+    let mut parser = Parser::default();
     let mut clients: Vec<Client> = Vec::new();
     let mut buf = [0u8; 8192];
     let mut killed = false;
@@ -118,6 +121,11 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
                 Err(e) if e.kind() == ErrorKind::Interrupted => 0,
                 r => r?,
             };
+            // Every byte goes through the emulator, so the server always
+            // knows what the pane looks like, attached clients or not.
+            parser.advance(&mut screen, &buf[..n]);
+            // Live output still goes to clients unchanged; milestone 4
+            // replaces this with rendering from `screen`.
             // Blocking writes: a client that stops reading stalls the whole
             // server. tmux avoids that with per-client output buffers.
             let msg = Msg::Output(buf[..n].to_vec()).encode();
@@ -131,7 +139,7 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
             if !is_ready || killed {
                 return !killed;
             }
-            match handle(c, &master) {
+            match handle(c, &master, &mut screen) {
                 Ok(Handled::Keep) => true,
                 Ok(Handled::Drop) => false,
                 Ok(Handled::KillSession) => {
@@ -156,7 +164,9 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
     }
 
     eprintln!("session over (killed: {killed})");
+    let reset = Msg::Output(render::reset(&screen));
     for mut c in clients {
+        let _ = reset.send(&mut c.stream);
         let _ = Msg::Exited.send(&mut c.stream);
     }
     // Closing the master hangs up the slave: the kernel sends SIGHUP to the
@@ -168,7 +178,12 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
     Ok(())
 }
 
-fn handle(c: &mut Client, master: &File) -> Result<Handled> {
+fn resize(master: &File, screen: &mut Screen, rows: u16, cols: u16) -> Result<()> {
+    screen.resize(rows.into(), cols.into());
+    pty::set_winsize(master.as_fd(), &pty::winsize(rows, cols))
+}
+
+fn handle(c: &mut Client, master: &File, screen: &mut Screen) -> Result<Handled> {
     let mut tmp = [0u8; 8192];
     let n = c.stream.read(&mut tmp)?;
     if n == 0 {
@@ -180,18 +195,23 @@ fn handle(c: &mut Client, master: &File) -> Result<Handled> {
         match msg {
             Msg::Hello { rows, cols } => {
                 eprintln!("client attached at {cols}x{rows}");
-                // No screen model yet (milestone 3), so we cannot repaint the
-                // client ourselves. Instead, wiggle the size: full-screen
-                // programs get SIGWINCH and redraw. dtach's "winch" redraw
-                // method does the same.
-                let narrower = pty::winsize(rows, cols.saturating_sub(1).max(1));
-                pty::set_winsize(master.as_fd(), &narrower)?;
-                pty::set_winsize(master.as_fd(), &pty::winsize(rows, cols))?;
+                // Fit the screen to this client, then paint it from our copy.
+                // If the size changed, the program also gets SIGWINCH and
+                // redraws itself on top.
+                resize(master, screen, rows, cols)?;
+                Msg::Output(render::repaint(screen)).send(&mut c.stream)?;
             }
-            Msg::Resize { rows, cols } => pty::set_winsize(master.as_fd(), &pty::winsize(rows, cols))?,
+            Msg::Resize { rows, cols } => resize(master, screen, rows, cols)?,
             Msg::Input(bytes) => (&*master).write_all(&bytes)?,
             Msg::Detach => {
                 eprintln!("client detached");
+                // Undo the pane's terminal modes before the client goes back
+                // to its shell. The client reads until we hang up.
+                Msg::Output(render::reset(screen)).send(&mut c.stream)?;
+                return Ok(Handled::Drop);
+            }
+            Msg::Capture => {
+                Msg::Output(screen.text().into_bytes()).send(&mut c.stream)?;
                 return Ok(Handled::Drop);
             }
             Msg::Kill => return Ok(Handled::KillSession),

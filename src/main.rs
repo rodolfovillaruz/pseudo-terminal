@@ -1,11 +1,13 @@
 mod client;
 mod proto;
 mod pty;
+mod render;
 mod server;
 mod session;
 mod term;
+mod vt;
 
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 
@@ -44,6 +46,12 @@ enum Cmd {
     /// List sessions
     #[command(alias = "list-sessions")]
     Ls,
+    /// Print the session's screen as text (tmux: capture-pane -p)
+    #[command(alias = "capture-pane")]
+    Capture {
+        #[arg(short = 't')]
+        target: Option<String>,
+    },
     /// Kill a session
     #[command(alias = "kill-session")]
     Kill {
@@ -79,12 +87,26 @@ fn main() -> Result<()> {
                 println!("{name}");
             }
         }
+        Cmd::Capture { target } => {
+            let mut stream = connect(&session::resolve(target)?)?;
+            Msg::Capture.send(&mut stream)?;
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf)?;
+            while let Some(msg) = proto::decode(&mut buf)? {
+                if let Msg::Output(text) = msg {
+                    io::stdout().write_all(&text)?;
+                }
+            }
+        }
         Cmd::Kill { target } => {
             let name = session::resolve(target)?;
-            let mut stream = UnixStream::connect(session::socket_path(&name)?)
-                .with_context(|| format!("can't find session: {name}"))?;
+            let mut stream = connect(&name)?;
             Msg::Kill.send(&mut stream)?;
         }
     }
     Ok(())
+}
+
+fn connect(name: &str) -> Result<UnixStream> {
+    UnixStream::connect(session::socket_path(name)?).with_context(|| format!("can't find session: {name}"))
 }

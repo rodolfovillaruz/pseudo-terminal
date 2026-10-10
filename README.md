@@ -16,6 +16,7 @@ ptmux new -s work        # named session
 ptmux new -d top         # detached session running a command
 ptmux ls                 # list sessions
 ptmux attach [-t name]   # reattach
+ptmux capture [-t name]  # print the screen as text
 ptmux kill [-t name]     # end a session
 ```
 
@@ -28,11 +29,18 @@ Sockets and server logs live in `$XDG_RUNTIME_DIR/ptmux/`.
 |---|-----------|--------|-------|
 | 1 | PTY passthrough (like `script`) | done | [docs/01-pty.md](docs/01-pty.md) |
 | 2 | Detach / reattach over a Unix socket (like `dtach`) | done | [docs/02-detach.md](docs/02-detach.md) |
-| 3 | Virtual screen: VT parser + cell grid | todo | |
+| 3 | Virtual screen: VT parser + cell grid | done | [docs/03-screen.md](docs/03-screen.md) |
 | 4 | Diff-based rendering + status line | todo | |
 | 5 | Windows and split panes | todo | |
 
 Start with [docs/00-overview.md](docs/00-overview.md).
+
+## Tests
+
+```sh
+cargo test                # parser, screen, render round-trips, protocol
+experiments/parity.sh     # ptmux's grid vs what tmux draws, for vim/less/htop
+```
 
 ## Reading the real thing
 

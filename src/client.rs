@@ -83,8 +83,8 @@ pub fn attach(name: &str) -> Result<()> {
         let _raw = term::RawGuard::enter(tty)?;
         relay(&mut stream)?
     };
-    // Undo whatever attributes the pane left on: tmux gets this for free
-    // because it redraws the whole terminal itself (milestone 4).
+    // The server has already sent a reset (render::reset) unless it died;
+    // these two are a cheap fallback for that case.
     print!("\x1b[0m\x1b[?25h\r\n");
     match outcome {
         Outcome::Detached => println!("[detached (from session {name})]"),
@@ -132,6 +132,17 @@ fn relay(stream: &mut UnixStream) -> Result<Outcome> {
             }
             if detach || n == 0 {
                 Msg::Detach.send(stream)?;
+                // The server answers with bytes that reset the terminal's
+                // modes, then hangs up.
+                let mut rest = Vec::new();
+                let _ = stream.read_to_end(&mut rest);
+                inbuf.extend(rest);
+                while let Some(msg) = proto::decode(&mut inbuf)? {
+                    if let Msg::Output(bytes) = msg {
+                        stdout.write_all(&bytes)?;
+                    }
+                }
+                stdout.flush()?;
                 return Ok(Outcome::Detached);
             }
         }

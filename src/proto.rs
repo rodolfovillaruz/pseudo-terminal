@@ -18,6 +18,8 @@ pub enum Msg {
     Resize { rows: u16, cols: u16 },
     Detach,
     Kill,
+    /// Ask for the screen contents as text; the server replies and hangs up.
+    Capture,
     // server -> client
     Output(Vec<u8>),
     Exited,
@@ -36,6 +38,7 @@ impl Msg {
             Msg::Kill => 5,
             Msg::Output(_) => 6,
             Msg::Exited => 7,
+            Msg::Capture => 8,
         }
     }
 
@@ -45,7 +48,7 @@ impl Msg {
                 [rows.to_be_bytes(), cols.to_be_bytes()].concat()
             }
             Msg::Input(b) | Msg::Output(b) => b.clone(),
-            Msg::Detach | Msg::Kill | Msg::Exited => Vec::new(),
+            Msg::Detach | Msg::Kill | Msg::Exited | Msg::Capture => Vec::new(),
         };
         let mut out = Vec::with_capacity(HEADER + payload.len());
         out.push(self.tag());
@@ -93,6 +96,7 @@ pub fn decode(buf: &mut Vec<u8>) -> Result<Option<Msg>> {
         5 => Msg::Kill,
         6 => Msg::Output(payload),
         7 => Msg::Exited,
+        8 => Msg::Capture,
         _ => bail!("unknown message tag {tag}"),
     };
     Ok(Some(msg))
@@ -112,6 +116,7 @@ mod tests {
             Msg::Kill,
             Msg::Output(vec![0x1b, b'[', b'H']),
             Msg::Exited,
+            Msg::Capture,
         ];
         let mut buf: Vec<u8> = msgs.iter().flat_map(Msg::encode).collect();
         for m in &msgs {
