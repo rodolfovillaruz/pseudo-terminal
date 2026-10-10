@@ -83,6 +83,9 @@ struct Client {
     /// What the client's terminal shows; set once it attaches (`Hello`).
     /// Connections from `ls`, `capture` and `kill` never get one.
     tty: Option<Tty>,
+    /// When the client last attached, resized or typed, as a value of
+    /// `Session::activity`. The most recent one sizes the pane.
+    active: u64,
     /// For the log: pane output since attaching vs. bytes we sent.
     pane_bytes_at_attach: usize,
     sent: usize,
@@ -100,6 +103,8 @@ struct Session {
     screen: Screen,
     parser: Parser,
     pane_bytes: usize,
+    /// Counts client activity, to order clients by `Client::active`.
+    activity: u64,
 }
 
 fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result<()> {
@@ -113,6 +118,7 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
         screen: Screen::new(ws.ws_row.into(), ws.ws_col.into()),
         parser: Parser::default(),
         pane_bytes: 0,
+        activity: 0,
     };
     let mut clients: Vec<Client> = Vec::new();
     let mut killed = false;
@@ -160,12 +166,12 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
 
         if ready[0] {
             let (stream, _) = listener.accept()?;
-            clients.push(Client { stream, buf: Vec::new(), tty: None, pane_bytes_at_attach: 0, sent: 0 });
+            clients.push(Client { stream, buf: Vec::new(), tty: None, active: 0, pane_bytes_at_attach: 0, sent: 0 });
         }
 
         // Fit the pane before composing anyone's frame, so a size change
         // from an attach, resize or detach reaches every client at once.
-        if let Some((rows, cols)) = smallest(clients.iter().filter_map(|c| c.tty.as_ref())) {
+        if let Some((rows, cols)) = latest(clients.iter().filter_map(|c| Some((c.active, c.tty.as_ref()?)))) {
             s.resize(rows, cols)?;
         }
 
@@ -234,7 +240,7 @@ impl Session {
         Frame::compose(&self.screen, rows, cols)
     }
 
-    /// Fits the pane to the attached terminals; see `smallest`.
+    /// Fits the pane to the attached terminals; see `latest`.
     fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         if (usize::from(rows), usize::from(cols)) == (self.screen.rows, self.screen.cols) {
             return Ok(());
@@ -252,6 +258,10 @@ fn handle(c: &mut Client, s: &mut Session) -> Result<Handled> {
     }
     c.buf.extend_from_slice(&tmp[..n]);
     while let Some(msg) = proto::decode(&mut c.buf)? {
+        if let Msg::Hello { .. } | Msg::Resize { .. } | Msg::Input(_) = msg {
+            s.activity += 1;
+            c.active = s.activity;
+        }
         match msg {
             Msg::Hello { rows, cols } => {
                 let (rows, cols) = (rows.max(1), cols.max(1));
@@ -294,14 +304,14 @@ fn handle(c: &mut Client, s: &mut Session) -> Result<Handled> {
     Ok(Handled::Keep)
 }
 
-/// The pane size for these terminals: the smallest rows and the smallest
-/// cols, so every client sees the whole pane and larger ones get blank
-/// space. tmux calls this `window-size smallest` (resize.c,
-/// `recalculate_size`); screen does the same. `None` with no terminals.
-fn smallest<'a>(ttys: impl Iterator<Item = &'a Tty>) -> Option<(u16, u16)> {
-    ttys.map(|t| (t.rows, t.cols))
-        .reduce(|(r, c), (r2, c2)| (r.min(r2), c.min(c2)))
-        .map(|(r, c)| (r as u16, c as u16))
+/// The pane size: that of the most recently active terminal, so the
+/// client in use always gets a pane that fills it. Smaller clients see it
+/// clipped, larger ones get blank space. tmux calls this `window-size
+/// latest`, its default since 3.1 (resize.c, `recalculate_size`). `None`
+/// with no terminals.
+fn latest<'a>(ttys: impl Iterator<Item = (u64, &'a Tty)>) -> Option<(u16, u16)> {
+    ttys.max_by_key(|&(active, _)| active)
+        .map(|(_, t)| (t.rows as u16, t.cols as u16))
 }
 
 fn readable_now(fd: BorrowedFd) -> bool {
@@ -341,10 +351,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pane_fits_the_smallest_terminal() {
-        assert_eq!(smallest([].iter()), None);
-        let ttys = [Tty::new(24, 80), Tty::new(20, 100), Tty::new(30, 90)];
-        assert_eq!(smallest(ttys.iter()), Some((20, 80)));
-        assert_eq!(smallest(ttys[1..].iter()), Some((20, 90)));
+    fn pane_follows_the_latest_terminal() {
+        assert_eq!(latest([].into_iter()), None);
+        let (a, b) = (Tty::new(33, 281), Tty::new(33, 60));
+        assert_eq!(latest([(1, &a), (2, &b)].into_iter()), Some((33, 60)));
+        assert_eq!(latest([(3, &a), (2, &b)].into_iter()), Some((33, 281)));
     }
 }
