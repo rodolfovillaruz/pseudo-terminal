@@ -163,6 +163,12 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
             clients.push(Client { stream, buf: Vec::new(), tty: None, pane_bytes_at_attach: 0, sent: 0 });
         }
 
+        // Fit the pane before composing anyone's frame, so a size change
+        // from an attach, resize or detach reaches every client at once.
+        if let Some((rows, cols)) = smallest(clients.iter().filter_map(|c| c.tty.as_ref())) {
+            s.resize(rows, cols)?;
+        }
+
         // Bring every attached terminal up to date. Pane output is never
         // forwarded as is: each client gets the difference between what its
         // terminal shows and what it should show.
@@ -228,8 +234,11 @@ impl Session {
         Frame::compose(&self.screen, rows, cols)
     }
 
-    /// Fits the pane to a client terminal: the pane is the whole terminal.
+    /// Fits the pane to the attached terminals; see `smallest`.
     fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        if (usize::from(rows), usize::from(cols)) == (self.screen.rows, self.screen.cols) {
+            return Ok(());
+        }
         self.screen.resize(rows.into(), cols.into());
         pty::set_winsize(self.master.as_fd(), &pty::winsize(rows, cols))
     }
@@ -247,10 +256,9 @@ fn handle(c: &mut Client, s: &mut Session) -> Result<Handled> {
             Msg::Hello { rows, cols } => {
                 let (rows, cols) = (rows.max(1), cols.max(1));
                 eprintln!("client attached at {cols}x{rows}");
-                s.resize(rows, cols)?;
+                // The main loop fits the pane and draws the first frame.
                 let mut tty = Tty::new(rows.into(), cols.into());
-                let mut out = tty.start();
-                out.extend(tty.draw(&s.frame(tty.rows, tty.cols)));
+                let out = tty.start();
                 c.sent = out.len();
                 c.pane_bytes_at_attach = s.pane_bytes;
                 c.tty = Some(tty);
@@ -258,7 +266,6 @@ fn handle(c: &mut Client, s: &mut Session) -> Result<Handled> {
             }
             Msg::Resize { rows, cols } => {
                 let (rows, cols) = (rows.max(1), cols.max(1));
-                s.resize(rows, cols)?;
                 if let Some(tty) = &mut c.tty {
                     tty.resize(rows.into(), cols.into());
                 }
@@ -285,6 +292,16 @@ fn handle(c: &mut Client, s: &mut Session) -> Result<Handled> {
         }
     }
     Ok(Handled::Keep)
+}
+
+/// The pane size for these terminals: the smallest rows and the smallest
+/// cols, so every client sees the whole pane and larger ones get blank
+/// space. tmux calls this `window-size smallest` (resize.c,
+/// `recalculate_size`); screen does the same. `None` with no terminals.
+fn smallest<'a>(ttys: impl Iterator<Item = &'a Tty>) -> Option<(u16, u16)> {
+    ttys.map(|t| (t.rows, t.cols))
+        .reduce(|(r, c), (r2, c2)| (r.min(r2), c.min(c2)))
+        .map(|(r, c)| (r as u16, c as u16))
 }
 
 fn readable_now(fd: BorrowedFd) -> bool {
@@ -317,4 +334,17 @@ pub fn shell_command(line: &str) -> Result<Command> {
         path: CString::new("/bin/sh")?,
         argv: vec![CString::new("sh")?, CString::new("-c")?, CString::new(line)?],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_fits_the_smallest_terminal() {
+        assert_eq!(smallest([].iter()), None);
+        let ttys = [Tty::new(24, 80), Tty::new(20, 100), Tty::new(30, 90)];
+        assert_eq!(smallest(ttys.iter()), Some((20, 80)));
+        assert_eq!(smallest(ttys[1..].iter()), Some((20, 90)));
+    }
 }

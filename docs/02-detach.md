@@ -132,4 +132,6 @@ The binary was driven inside a detached tmux session:
   Milestone 3 tracks this.
 - When several clients with different sizes attach, the pty takes the size
   of whichever client spoke last. tmux sizes to the smallest or largest
-  client, depending on the `window-size` option.
+  client, depending on the `window-size` option. Fixed later: the pane now
+  takes the smallest rows and cols of all attached clients
+  (`smallest` in `src/server.rs`), like `window-size smallest`.
