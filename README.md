@@ -20,6 +20,15 @@ ptmux capture [-t name]  # print the screen as text
 ptmux kill [-t name]     # end a session
 ```
 
+Tab completion covers subcommands, flags and live session names
+(`ptmux attach -t <TAB>`). To turn it on, add one line to your shell rc:
+
+```sh
+source <(COMPLETE=bash ptmux)   # ~/.bashrc
+source <(COMPLETE=zsh ptmux)    # ~/.zshrc
+COMPLETE=fish ptmux | source    # ~/.config/fish/config.fish
+```
+
 Inside a session, `C-b d` detaches and `C-b C-b` sends a literal `C-b`.
 Sockets and server logs live in `$XDG_RUNTIME_DIR/ptmux/`.
 

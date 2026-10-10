@@ -13,7 +13,8 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 
 use crate::proto::Msg;
 
@@ -41,7 +42,7 @@ enum Cmd {
     /// Attach to a running session
     #[command(alias = "a", alias = "attach-session")]
     Attach {
-        #[arg(short = 't')]
+        #[arg(short = 't', add = ArgValueCandidates::new(sessions))]
         target: Option<String>,
     },
     /// List sessions
@@ -50,18 +51,20 @@ enum Cmd {
     /// Print the session's screen as text (tmux: capture-pane -p)
     #[command(alias = "capture-pane")]
     Capture {
-        #[arg(short = 't')]
+        #[arg(short = 't', add = ArgValueCandidates::new(sessions))]
         target: Option<String>,
     },
     /// Kill a session
     #[command(alias = "kill-session")]
     Kill {
-        #[arg(short = 't')]
+        #[arg(short = 't', add = ArgValueCandidates::new(sessions))]
         target: Option<String>,
     },
 }
 
 fn main() -> Result<()> {
+    // Only acts when the shell calls back with $COMPLETE set (see README).
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
     match Cli::parse().cmd {
         Cmd::New { name, detached, command } => {
             if !detached && std::env::var_os("PTMUX").is_some() {
@@ -106,6 +109,11 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Session names for `-t <TAB>`. Completion must stay quiet, so errors give no candidates.
+fn sessions() -> Vec<CompletionCandidate> {
+    session::list().unwrap_or_default().into_iter().map(CompletionCandidate::new).collect()
 }
 
 fn connect(name: &str) -> Result<UnixStream> {
