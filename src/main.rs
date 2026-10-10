@@ -1,17 +1,18 @@
+mod client;
+mod proto;
 mod pty;
+mod server;
+mod session;
 mod term;
 
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixStream;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use nix::errno::Errno;
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
-use nix::sys::wait::waitpid;
-use nix::unistd::{read, write};
+
+use crate::proto::Msg;
 
 #[derive(Parser)]
 #[command(about = "A tiny tmux/screen clone built to learn how they work")]
@@ -22,93 +23,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Run a shell inside a new pty (milestone 1: plain passthrough)
+    /// Start a new session and attach to it
+    #[command(alias = "new-session")]
     New {
-        /// Program to run instead of $SHELL
-        #[arg(short, long)]
-        command: Option<String>,
+        /// Session name (default: next free number)
+        #[arg(short = 's')]
+        name: Option<String>,
+        /// Don't attach
+        #[arg(short = 'd')]
+        detached: bool,
+        /// Command to run instead of $SHELL (passed to sh -c)
+        command: Vec<String>,
     },
-}
-
-static WINCH: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_winch(_: i32) {
-    WINCH.store(true, Ordering::Relaxed);
+    /// Attach to a running session
+    #[command(alias = "a", alias = "attach-session")]
+    Attach {
+        #[arg(short = 't')]
+        target: Option<String>,
+    },
+    /// List sessions
+    #[command(alias = "list-sessions")]
+    Ls,
+    /// Kill a session
+    #[command(alias = "kill-session")]
+    Kill {
+        #[arg(short = 't')]
+        target: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::New { command } => {
-            let shell = command
-                .or_else(|| std::env::var("SHELL").ok())
-                .unwrap_or_else(|| "/bin/sh".into());
-            passthrough(&shell)
+        Cmd::New { name, detached, command } => {
+            if !detached && std::env::var_os("PTMUX").is_some() {
+                bail!("sessions should be nested with care, unset $PTMUX to force");
+            }
+            let name = match name {
+                Some(n) => n,
+                None => session::next_free_name()?,
+            };
+            let cmd = if command.is_empty() {
+                server::default_command()?
+            } else {
+                server::shell_command(&command.join(" "))?
+            };
+            let ws = pty::get_winsize(io::stdin().as_fd()).unwrap_or(pty::winsize(24, 80));
+            server::start(&name, cmd, ws)?;
+            if !detached {
+                client::attach(&name)?;
+            }
+        }
+        Cmd::Attach { target } => client::attach(&session::resolve(target)?)?,
+        Cmd::Ls => {
+            for name in session::list()? {
+                println!("{name}");
+            }
+        }
+        Cmd::Kill { target } => {
+            let name = session::resolve(target)?;
+            let mut stream = UnixStream::connect(session::socket_path(&name)?)
+                .with_context(|| format!("can't find session: {name}"))?;
+            Msg::Kill.send(&mut stream)?;
         }
     }
-}
-
-/// Milestone 1: the core loop every terminal multiplexer is built around.
-/// Bytes from the real terminal go to the pty master, bytes from the pty
-/// master go to the real terminal.
-fn passthrough(shell: &str) -> Result<()> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let tty = stdin.as_fd();
-
-    let pty = pty::spawn(shell, &pty::get_winsize(tty)?)?;
-
-    // No SA_RESTART: poll() returns EINTR on resize so we notice it promptly.
-    let act = SigAction::new(SigHandler::Handler(on_winch), SaFlags::empty(), SigSet::empty());
-    unsafe { sigaction(Signal::SIGWINCH, &act)? };
-
-    let _raw = term::RawGuard::enter(tty)?;
-    let mut buf = [0u8; 8192];
-
-    loop {
-        if WINCH.swap(false, Ordering::Relaxed) {
-            pty::set_winsize(pty.master.as_fd(), &pty::get_winsize(tty)?)?;
-        }
-
-        let mut fds = [
-            PollFd::new(tty, PollFlags::POLLIN),
-            PollFd::new(pty.master.as_fd(), PollFlags::POLLIN),
-        ];
-        match poll(&mut fds, PollTimeout::NONE) {
-            Err(Errno::EINTR) => continue,
-            r => r?,
-        };
-
-        if ready(&fds[0]) && !copy(tty, pty.master.as_fd(), &mut buf)? {
-            break;
-        }
-        // EIO on the master means the slave side has been closed: the child exited.
-        if ready(&fds[1]) && !copy(pty.master.as_fd(), stdout.as_fd(), &mut buf)? {
-            break;
-        }
-    }
-
-    let _ = waitpid(pty.child, None);
     Ok(())
-}
-
-fn ready(fd: &PollFd) -> bool {
-    fd.revents()
-        .is_some_and(|r| r.intersects(PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR))
-}
-
-/// Copies one read's worth of bytes. Returns false at end of input.
-fn copy(from: BorrowedFd, to: BorrowedFd, buf: &mut [u8]) -> Result<bool> {
-    let n = match read(from, buf) {
-        Ok(0) | Err(Errno::EIO) => return Ok(false),
-        Err(Errno::EINTR | Errno::EAGAIN) => return Ok(true),
-        r => r?,
-    };
-    let mut off = 0;
-    while off < n {
-        match write(to, &buf[off..n]) {
-            Err(Errno::EINTR) => continue,
-            r => off += r?,
-        }
-    }
-    Ok(true)
 }

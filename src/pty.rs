@@ -5,7 +5,7 @@
 //! `spawn_pane()` (spawn.c), which calls fdforkpty(), and screen
 //! `OpenDevice()` / `ForkWindow()` (pty.c, window.c).
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 
 use anyhow::{Context, Result};
@@ -31,8 +31,9 @@ pub fn get_winsize(fd: BorrowedFd) -> Result<Winsize> {
     })
 }
 
-/// Sets the window size of a pty master (TIOCSWINSZ). The kernel then sends
-/// SIGWINCH to the foreground process group on the slave side.
+/// Sets the window size of a pty master (TIOCSWINSZ). If the size actually
+/// changed, the kernel sends SIGWINCH to the foreground process group on
+/// the slave side.
 pub fn set_winsize(fd: BorrowedFd, ws: &Winsize) -> Result<()> {
     let ws = libc::winsize {
         ws_row: ws.ws_row,
@@ -46,14 +47,18 @@ pub fn set_winsize(fd: BorrowedFd, ws: &Winsize) -> Result<()> {
     Ok(())
 }
 
-/// Opens a pty of the given size and runs `program` on its slave side.
-pub fn spawn(program: &str, ws: &Winsize) -> Result<Pty> {
+pub fn winsize(rows: u16, cols: u16) -> Winsize {
+    Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 }
+}
+
+/// Opens a pty of the given size and execs `path` with `argv` on its slave
+/// side. `env` holds extra `KEY=VALUE` strings for the child.
+pub fn spawn(path: &CStr, argv: &[CString], env: &[CString], ws: &Winsize) -> Result<Pty> {
     let pair = openpty(Some(ws), None).context("openpty")?;
 
     // Allocate everything before fork: only async-signal-safe calls in the child.
-    let prog = CString::new(program)?;
-    let argv = [prog.as_ptr(), std::ptr::null()];
-    let term = CString::new("TERM=xterm-256color")?;
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
 
     match unsafe { fork() }.context("fork")? {
         ForkResult::Child => unsafe {
@@ -66,8 +71,10 @@ pub fn spawn(program: &str, ws: &Winsize) -> Result<Pty> {
             libc::dup2(slave, 2);
             libc::close(slave);
             libc::close(pair.master.as_raw_fd());
-            libc::putenv(term.as_ptr() as *mut _);
-            libc::execvp(prog.as_ptr(), argv.as_ptr());
+            for e in env {
+                libc::putenv(e.as_ptr() as *mut _);
+            }
+            libc::execvp(path.as_ptr(), argv_ptrs.as_ptr());
             libc::_exit(127);
         },
         ForkResult::Parent { child } => {

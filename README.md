@@ -9,16 +9,25 @@ with the real implementations.
 
 ```sh
 cargo build
-cargo run -- new                 # runs $SHELL inside a new pty
-cargo run -- new -c /bin/bash    # or any program
+alias ptmux=$PWD/target/debug/ptmux
+
+ptmux new                # new session running $SHELL, attached
+ptmux new -s work        # named session
+ptmux new -d top         # detached session running a command
+ptmux ls                 # list sessions
+ptmux attach [-t name]   # reattach
+ptmux kill [-t name]     # end a session
 ```
+
+Inside a session, `C-b d` detaches and `C-b C-b` sends a literal `C-b`.
+Sockets and server logs live in `$XDG_RUNTIME_DIR/ptmux/`.
 
 ## Milestones
 
 | # | Mechanism | Status | Notes |
 |---|-----------|--------|-------|
 | 1 | PTY passthrough (like `script`) | done | [docs/01-pty.md](docs/01-pty.md) |
-| 2 | Detach / reattach over a Unix socket (like `dtach`) | todo | |
+| 2 | Detach / reattach over a Unix socket (like `dtach`) | done | [docs/02-detach.md](docs/02-detach.md) |
 | 3 | Virtual screen: VT parser + cell grid | todo | |
 | 4 | Diff-based rendering + status line | todo | |
 | 5 | Windows and split panes | todo | |

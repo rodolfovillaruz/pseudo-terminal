@@ -26,7 +26,8 @@ outer line discipline stops interpreting keys. Typing `^C` then sends a
 byte into SIGINT for the foreground job. The guard restores the saved
 termios on drop.
 
-`src/main.rs` `passthrough()`:
+`passthrough()` in `src/main.rs` (commit `33ac67b`; milestone 2 splits it
+into the server and client loops):
 
 - A `poll()` loop over stdin and the master copies whichever side is ready.
 - On **SIGWINCH**, it reads the real size (`TIOCGWINSZ` on stdin) and writes
