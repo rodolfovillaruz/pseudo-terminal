@@ -13,7 +13,7 @@ use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 
 use anyhow::{Context, Result, bail};
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 
 use crate::proto::Msg;
@@ -64,8 +64,9 @@ enum Cmd {
 
 fn main() -> Result<()> {
     // Only acts when the shell calls back with $COMPLETE set (see README).
-    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
-    match Cli::parse().cmd {
+    clap_complete::CompleteEnv::with_factory(command).complete();
+    let cli = Cli::from_arg_matches(&command().get_matches()).unwrap_or_else(|e| e.exit());
+    match cli.cmd {
         Cmd::New { name, detached, command } => {
             if !detached && std::env::var_os("PTMUX").is_some() {
                 bail!("sessions should be nested with care, unset $PTMUX to force");
@@ -109,6 +110,27 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The clap command with each subcommand's aliases appended to its help line.
+/// They stay plain `alias`es: clap_complete shows one name per command, and with
+/// `visible_alias` it picks the alphabetically first (`ptmux a<TAB>` -> `a`).
+fn command() -> clap::Command {
+    let mut cmd = Cli::command();
+    let names: Vec<String> = cmd.get_subcommands().map(|sc| sc.get_name().to_owned()).collect();
+    for name in names {
+        cmd = cmd.mut_subcommand(name, |sc| {
+            let aliases: Vec<&str> = sc.get_all_aliases().collect();
+            let label = match aliases.len() {
+                0 => return sc,
+                1 => "alias",
+                _ => "aliases",
+            };
+            let about = format!("{} [{label}: {}]", sc.get_about().map(|a| a.to_string()).unwrap_or_default(), aliases.join(", "));
+            sc.about(about)
+        });
+    }
+    cmd
 }
 
 /// Session names for `-t <TAB>`. Completion must stay quiet, so errors give no candidates.
