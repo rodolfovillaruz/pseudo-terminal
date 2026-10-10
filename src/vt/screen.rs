@@ -100,6 +100,8 @@ pub struct Screen {
     pub app_keypad: bool,
     pub private_modes: BTreeSet<u16>,
     pub title: String,
+    /// Answers to queries (DSR, DA) waiting to be written back to the pty.
+    pub replies: Vec<u8>,
     tabs: Vec<bool>,
     last_char: char,
 }
@@ -123,6 +125,7 @@ impl Screen {
             app_keypad: false,
             private_modes: BTreeSet::new(),
             title: String::new(),
+            replies: Vec::new(),
             tabs: (0..cols).map(|c| c % 8 == 0).collect(),
             last_char: ' ',
         }
@@ -652,8 +655,19 @@ impl Perform for Screen {
             }
             ([], 's') => self.save_cursor(),
             ([], 'u') => self.restore_cursor(),
-            // Queries (DSR, DA, ...) are answered by the real terminal for
-            // now, since pane output still reaches it unchanged.
+            // Queries. The real terminal never sees pane output, so we
+            // answer for it, as tmux does in input.c (`input_csi_dispatch`).
+            ([], 'n') => match p(0, 0) {
+                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                6 => {
+                    let r = if self.cur.origin { row - self.top } else { row };
+                    self.replies.extend(format!("\x1b[{};{}R", r + 1, col + 1).into_bytes());
+                }
+                _ => {}
+            },
+            // DA1: tmux claims to be a VT100 with advanced video option.
+            ([], 'c') if p(0, 0) == 0 => self.replies.extend_from_slice(b"\x1b[?1;2c"),
+            ([b'>'], 'c') if p(0, 0) == 0 => self.replies.extend_from_slice(b"\x1b[>0;0;0c"),
             _ => {}
         }
     }
@@ -797,6 +811,12 @@ mod tests {
         s.resize(2, 3);
         assert_eq!(lines(&s), ["3", "4"]);
         assert_eq!((s.cur.row, s.cur.col), (1, 1));
+    }
+
+    #[test]
+    fn answers_queries() {
+        let s = screen(5, 10, b"\x1b[3;4H\x1b[6n\x1b[5n\x1b[c\x1b[>c");
+        assert_eq!(s.replies, b"\x1b[3;4R\x1b[0n\x1b[?1;2c\x1b[>0;0;0c");
     }
 
     #[test]

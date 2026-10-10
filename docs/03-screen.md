@@ -46,7 +46,7 @@ parser.
 - Resize keeps the cursor line visible by dropping lines from the top
   (like xterm). Text is not reflowed.
 
-**Render** (`src/render.rs`):
+**Render** (`src/render.rs`, replaced by `src/tty.rs` in milestone 4):
 
 - `repaint(screen)` brings a blank terminal into the same state: enter the
   alternate screen if needed, clear, draw each row with minimal SGR changes,

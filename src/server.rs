@@ -8,7 +8,7 @@
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 
@@ -20,8 +20,9 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, fork, setsid};
 
 use crate::proto::{self, Msg};
+use crate::tty::{Frame, Tty};
 use crate::vt::{Parser, Screen};
-use crate::{pty, render};
+use crate::{pty, status};
 
 /// What to run in the session's pty.
 pub struct Command {
@@ -62,7 +63,7 @@ pub fn start(name: &str, cmd: Command, ws: Winsize) -> Result<()> {
                 libc::dup2(log.as_raw_fd(), 2);
             }
             eprintln!("server {} starting session {name}", std::process::id());
-            let code = match run(listener, &path, cmd, ws) {
+            let code = match run(listener, &path, name, cmd, ws) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("server error: {e:#}");
@@ -79,6 +80,12 @@ pub fn start(name: &str, cmd: Command, ws: Winsize) -> Result<()> {
 struct Client {
     stream: UnixStream,
     buf: Vec<u8>,
+    /// What the client's terminal shows; set once it attaches (`Hello`).
+    /// Connections from `ls`, `capture` and `kill` never get one.
+    tty: Option<Tty>,
+    /// For the log: pane output since attaching vs. bytes we sent.
+    pane_bytes_at_attach: usize,
+    sent: usize,
 }
 
 enum Handled {
@@ -87,49 +94,59 @@ enum Handled {
     KillSession,
 }
 
-fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result<()> {
+/// The session's one pane, and what the status line needs to know.
+struct Session {
+    name: String,
+    master: File,
+    screen: Screen,
+    parser: Parser,
+    /// Window name when the foreground process can't be found.
+    default_window: String,
+    hostname: String,
+    pane_bytes: usize,
+}
+
+fn run(listener: UnixListener, path: &Path, name: &str, cmd: Command, ws: Winsize) -> Result<()> {
     let env = [
         CString::new("TERM=xterm-256color")?,
         CString::new(format!("PTMUX={}", path.display()))?,
     ];
+    let default_window = cmd.argv[0].to_string_lossy().trim_start_matches('-').to_owned();
     let pty = pty::spawn(&cmd.path, &cmd.argv, &env, &ws)?;
-    let mut master = File::from(pty.master);
-    let mut screen = Screen::new(ws.ws_row.into(), ws.ws_col.into());
-    let mut parser = Parser::default();
+    let mut s = Session {
+        name: name.to_owned(),
+        master: File::from(pty.master),
+        screen: Screen::new(ws.ws_row.into(), ws.ws_col.into()),
+        parser: Parser::default(),
+        default_window,
+        hostname: status::hostname(),
+        pane_bytes: 0,
+    };
     let mut clients: Vec<Client> = Vec::new();
-    let mut buf = [0u8; 8192];
     let mut killed = false;
 
     loop {
+        // While someone is attached, wake up every second so the status
+        // line clock moves even when the pane is quiet.
+        let timeout = if clients.iter().any(|c| c.tty.is_some()) {
+            PollTimeout::from(1000u16)
+        } else {
+            PollTimeout::NONE
+        };
         let mut fds = vec![
             PollFd::new(listener.as_fd(), PollFlags::POLLIN),
-            PollFd::new(master.as_fd(), PollFlags::POLLIN),
+            PollFd::new(s.master.as_fd(), PollFlags::POLLIN),
         ];
         fds.extend(clients.iter().map(|c| PollFd::new(c.stream.as_fd(), PollFlags::POLLIN)));
-        match poll(&mut fds, PollTimeout::NONE) {
+        match poll(&mut fds, timeout) {
             Err(Errno::EINTR) => continue,
             r => r?,
         };
         let ready: Vec<bool> = fds.iter().map(readable).collect();
         drop(fds);
 
-        if ready[1] {
-            let n = match master.read(&mut buf) {
-                Ok(0) => break,
-                // EIO: every slave fd is closed, i.e. the child has exited.
-                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
-                Err(e) if e.kind() == ErrorKind::Interrupted => 0,
-                r => r?,
-            };
-            // Every byte goes through the emulator, so the server always
-            // knows what the pane looks like, attached clients or not.
-            parser.advance(&mut screen, &buf[..n]);
-            // Live output still goes to clients unchanged; milestone 4
-            // replaces this with rendering from `screen`.
-            // Blocking writes: a client that stops reading stalls the whole
-            // server. tmux avoids that with per-client output buffers.
-            let msg = Msg::Output(buf[..n].to_vec()).encode();
-            clients.retain_mut(|c| c.stream.write_all(&msg).is_ok());
+        if ready[1] && !s.read_pane()? {
+            break;
         }
 
         let mut i = 0;
@@ -139,7 +156,7 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
             if !is_ready || killed {
                 return !killed;
             }
-            match handle(c, &master, &mut screen) {
+            match handle(c, &mut s) {
                 Ok(Handled::Keep) => true,
                 Ok(Handled::Drop) => false,
                 Ok(Handled::KillSession) => {
@@ -158,60 +175,128 @@ fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result
 
         if ready[0] {
             let (stream, _) = listener.accept()?;
-            eprintln!("client connected");
-            clients.push(Client { stream, buf: Vec::new() });
+            clients.push(Client { stream, buf: Vec::new(), tty: None, pane_bytes_at_attach: 0, sent: 0 });
         }
+
+        // Bring every attached terminal up to date. Pane output is never
+        // forwarded as is: each client gets the difference between what its
+        // terminal shows and what it should show.
+        clients.retain_mut(|c| {
+            let Some(tty) = &mut c.tty else { return true };
+            let out = tty.draw(&s.frame(tty.rows, tty.cols));
+            if out.is_empty() {
+                return true;
+            }
+            c.sent += out.len();
+            // Blocking write: a client that stops reading stalls the whole
+            // server. tmux avoids that with per-client output buffers.
+            Msg::Output(out).send(&mut c.stream).is_ok()
+        });
     }
 
     eprintln!("session over (killed: {killed})");
-    let reset = Msg::Output(render::reset(&screen));
     for mut c in clients {
-        let _ = reset.send(&mut c.stream);
-        let _ = Msg::Exited.send(&mut c.stream);
+        if let Some(tty) = &c.tty {
+            let _ = Msg::Output(tty.stop()).send(&mut c.stream);
+            let _ = Msg::Exited.send(&mut c.stream);
+        }
     }
     // Closing the master hangs up the slave: the kernel sends SIGHUP to the
     // child's session, which is how tmux kill-session ends a pane too.
-    drop(master);
+    drop(s);
     if !killed {
         let _ = waitpid(pty.child, None);
     }
     Ok(())
 }
 
-fn resize(master: &File, screen: &mut Screen, rows: u16, cols: u16) -> Result<()> {
-    screen.resize(rows.into(), cols.into());
-    pty::set_winsize(master.as_fd(), &pty::winsize(rows, cols))
+impl Session {
+    /// Reads what the pane has written, up to 64 KiB at a time, so a fast
+    /// producer is drawn once per batch instead of once per read. Returns
+    /// false once the pane has exited.
+    fn read_pane(&mut self) -> Result<bool> {
+        let mut buf = [0u8; 8192];
+        let mut total = 0;
+        loop {
+            let n = match self.master.read(&mut buf) {
+                Ok(0) => return Ok(false),
+                // EIO: every slave fd is closed, i.e. the child has exited.
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => return Ok(false),
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                r => r?,
+            };
+            self.parser.advance(&mut self.screen, &buf[..n]);
+            total += n;
+            if total >= 64 * 1024 || !readable_now(self.master.as_fd()) {
+                break;
+            }
+        }
+        self.pane_bytes += total;
+        if !self.screen.replies.is_empty() {
+            let replies = std::mem::take(&mut self.screen.replies);
+            (&self.master).write_all(&replies)?;
+        }
+        Ok(true)
+    }
+
+    fn frame(&self, rows: usize, cols: usize) -> Frame {
+        let window = status::foreground_name(self.master.as_fd()).unwrap_or_else(|| self.default_window.clone());
+        // Like tmux, the pane title defaults to the hostname.
+        let title = if self.screen.title.is_empty() { &self.hostname } else { &self.screen.title };
+        Frame::compose(&self.screen, rows, cols, status::line(&self.name, &window, title, cols))
+    }
+
+    /// Fits the pane to a client terminal, minus the status line.
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
+        let rows = rows.saturating_sub(1).max(1);
+        self.screen.resize(rows.into(), cols.into());
+        pty::set_winsize(self.master.as_fd(), &pty::winsize(rows, cols))
+    }
 }
 
-fn handle(c: &mut Client, master: &File, screen: &mut Screen) -> Result<Handled> {
+fn handle(c: &mut Client, s: &mut Session) -> Result<Handled> {
     let mut tmp = [0u8; 8192];
     let n = c.stream.read(&mut tmp)?;
     if n == 0 {
-        eprintln!("client disconnected");
         return Ok(Handled::Drop);
     }
     c.buf.extend_from_slice(&tmp[..n]);
     while let Some(msg) = proto::decode(&mut c.buf)? {
         match msg {
             Msg::Hello { rows, cols } => {
+                let (rows, cols) = (rows.max(1), cols.max(1));
                 eprintln!("client attached at {cols}x{rows}");
-                // Fit the screen to this client, then paint it from our copy.
-                // If the size changed, the program also gets SIGWINCH and
-                // redraws itself on top.
-                resize(master, screen, rows, cols)?;
-                Msg::Output(render::repaint(screen)).send(&mut c.stream)?;
+                s.resize(rows, cols)?;
+                let mut tty = Tty::new(rows.into(), cols.into());
+                let mut out = tty.start();
+                out.extend(tty.draw(&s.frame(tty.rows, tty.cols)));
+                c.sent = out.len();
+                c.pane_bytes_at_attach = s.pane_bytes;
+                c.tty = Some(tty);
+                Msg::Output(out).send(&mut c.stream)?;
             }
-            Msg::Resize { rows, cols } => resize(master, screen, rows, cols)?,
-            Msg::Input(bytes) => (&*master).write_all(&bytes)?,
+            Msg::Resize { rows, cols } => {
+                let (rows, cols) = (rows.max(1), cols.max(1));
+                s.resize(rows, cols)?;
+                if let Some(tty) = &mut c.tty {
+                    tty.resize(rows.into(), cols.into());
+                }
+            }
+            Msg::Input(bytes) => (&s.master).write_all(&bytes)?,
             Msg::Detach => {
-                eprintln!("client detached");
-                // Undo the pane's terminal modes before the client goes back
-                // to its shell. The client reads until we hang up.
-                Msg::Output(render::reset(screen)).send(&mut c.stream)?;
+                if let Some(tty) = &c.tty {
+                    eprintln!(
+                        "client detached: pane wrote {} bytes, client was sent {}",
+                        s.pane_bytes - c.pane_bytes_at_attach,
+                        c.sent
+                    );
+                    // Give the terminal back before the client returns to its shell.
+                    Msg::Output(tty.stop()).send(&mut c.stream)?;
+                }
                 return Ok(Handled::Drop);
             }
             Msg::Capture => {
-                Msg::Output(screen.text().into_bytes()).send(&mut c.stream)?;
+                Msg::Output(s.screen.text().into_bytes()).send(&mut c.stream)?;
                 return Ok(Handled::Drop);
             }
             Msg::Kill => return Ok(Handled::KillSession),
@@ -219,6 +304,11 @@ fn handle(c: &mut Client, master: &File, screen: &mut Screen) -> Result<Handled>
         }
     }
     Ok(Handled::Keep)
+}
+
+fn readable_now(fd: BorrowedFd) -> bool {
+    let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+    matches!(poll(&mut fds, PollTimeout::ZERO), Ok(n) if n > 0) && readable(&fds[0])
 }
 
 fn readable(fd: &PollFd) -> bool {

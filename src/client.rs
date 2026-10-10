@@ -83,9 +83,10 @@ pub fn attach(name: &str) -> Result<()> {
         let _raw = term::RawGuard::enter(tty)?;
         relay(&mut stream)?
     };
-    // The server has already sent a reset (render::reset) unless it died;
-    // these two are a cheap fallback for that case.
-    print!("\x1b[0m\x1b[?25h\r\n");
+    // The server gives the terminal back (Tty::stop) unless it died.
+    if let Outcome::LostServer = outcome {
+        print!("\x1b[0m\x1b[?25h\x1b[?7h\x1b[?1049l");
+    }
     match outcome {
         Outcome::Detached => println!("[detached (from session {name})]"),
         Outcome::Exited => println!("[exited]"),

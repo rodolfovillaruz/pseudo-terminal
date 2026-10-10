@@ -1,10 +1,11 @@
 mod client;
 mod proto;
 mod pty;
-mod render;
 mod server;
 mod session;
+mod status;
 mod term;
+mod tty;
 mod vt;
 
 use std::io::{self, Read, Write};

@@ -30,7 +30,7 @@ Sockets and server logs live in `$XDG_RUNTIME_DIR/ptmux/`.
 | 1 | PTY passthrough (like `script`) | done | [docs/01-pty.md](docs/01-pty.md) |
 | 2 | Detach / reattach over a Unix socket (like `dtach`) | done | [docs/02-detach.md](docs/02-detach.md) |
 | 3 | Virtual screen: VT parser + cell grid | done | [docs/03-screen.md](docs/03-screen.md) |
-| 4 | Diff-based rendering + status line | todo | |
+| 4 | Diff-based rendering + status line | done | [docs/04-render.md](docs/04-render.md) |
 | 5 | Windows and split panes | todo | |
 
 Start with [docs/00-overview.md](docs/00-overview.md).
@@ -38,8 +38,8 @@ Start with [docs/00-overview.md](docs/00-overview.md).
 ## Tests
 
 ```sh
-cargo test                # parser, screen, render round-trips, protocol
-experiments/parity.sh     # ptmux's grid vs what tmux draws, for vim/less/htop
+cargo test                # parser, screen, renderer simulation, protocol
+experiments/parity.sh     # what tmux draws from our output vs our grid: vim/less/htop/seq
 ```
 
 ## Reading the real thing
