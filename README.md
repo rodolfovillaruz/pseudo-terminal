@@ -40,7 +40,7 @@ Sockets and server logs live in `$XDG_RUNTIME_DIR/ptmux/`.
 | 2 | Detach / reattach over a Unix socket (like `dtach`) | done | [docs/02-detach.md](docs/02-detach.md) |
 | 3 | Virtual screen: VT parser + cell grid | done | [docs/03-screen.md](docs/03-screen.md) |
 | 4 | Diff-based rendering + status line | done | [docs/04-render.md](docs/04-render.md) |
-| 5 | Windows and split panes | todo | |
+| 5 | No status line: the pane is the whole terminal | done | [docs/05-no-status.md](docs/05-no-status.md) |
 
 Start with [docs/00-overview.md](docs/00-overview.md).
 

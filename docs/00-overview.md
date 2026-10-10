@@ -49,7 +49,7 @@ Every terminal multiplexer comes down to three jobs:
 | VT parsing | `input.c` | `ansi.c` | milestone 3 |
 | screen model | `grid.c`, `screen.c` | `ansi.c`, `mline` structs | milestone 3 |
 | drawing | `tty.c`, `screen-redraw.c` | `display.c` | milestone 4 |
-| splits | `layout.c` | regions in `display.c`/`canvas.c` | milestone 5 |
+| status line | `status.c` | `hardstatus` / `caption` | milestone 4, removed in 5 |
 
 File names come from recent upstream trees. Check them against `vendor/`,
 because code moves around between versions.

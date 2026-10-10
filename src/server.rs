@@ -22,7 +22,7 @@ use nix::unistd::{ForkResult, fork, setsid};
 use crate::proto::{self, Msg};
 use crate::tty::{Frame, Tty};
 use crate::vt::{Parser, Screen};
-use crate::{pty, status};
+use crate::pty;
 
 /// What to run in the session's pty.
 pub struct Command {
@@ -63,7 +63,7 @@ pub fn start(name: &str, cmd: Command, ws: Winsize) -> Result<()> {
                 libc::dup2(log.as_raw_fd(), 2);
             }
             eprintln!("server {} starting session {name}", std::process::id());
-            let code = match run(listener, &path, name, cmd, ws) {
+            let code = match run(listener, &path, cmd, ws) {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("server error: {e:#}");
@@ -94,51 +94,36 @@ enum Handled {
     KillSession,
 }
 
-/// The session's one pane, and what the status line needs to know.
+/// The session's one pane.
 struct Session {
-    name: String,
     master: File,
     screen: Screen,
     parser: Parser,
-    /// Window name when the foreground process can't be found.
-    default_window: String,
-    hostname: String,
     pane_bytes: usize,
 }
 
-fn run(listener: UnixListener, path: &Path, name: &str, cmd: Command, ws: Winsize) -> Result<()> {
+fn run(listener: UnixListener, path: &Path, cmd: Command, ws: Winsize) -> Result<()> {
     let env = [
         CString::new("TERM=xterm-256color")?,
         CString::new(format!("PTMUX={}", path.display()))?,
     ];
-    let default_window = cmd.argv[0].to_string_lossy().trim_start_matches('-').to_owned();
     let pty = pty::spawn(&cmd.path, &cmd.argv, &env, &ws)?;
     let mut s = Session {
-        name: name.to_owned(),
         master: File::from(pty.master),
         screen: Screen::new(ws.ws_row.into(), ws.ws_col.into()),
         parser: Parser::default(),
-        default_window,
-        hostname: status::hostname(),
         pane_bytes: 0,
     };
     let mut clients: Vec<Client> = Vec::new();
     let mut killed = false;
 
     loop {
-        // While someone is attached, wake up every second so the status
-        // line clock moves even when the pane is quiet.
-        let timeout = if clients.iter().any(|c| c.tty.is_some()) {
-            PollTimeout::from(1000u16)
-        } else {
-            PollTimeout::NONE
-        };
         let mut fds = vec![
             PollFd::new(listener.as_fd(), PollFlags::POLLIN),
             PollFd::new(s.master.as_fd(), PollFlags::POLLIN),
         ];
         fds.extend(clients.iter().map(|c| PollFd::new(c.stream.as_fd(), PollFlags::POLLIN)));
-        match poll(&mut fds, timeout) {
+        match poll(&mut fds, PollTimeout::NONE) {
             Err(Errno::EINTR) => continue,
             r => r?,
         };
@@ -240,15 +225,11 @@ impl Session {
     }
 
     fn frame(&self, rows: usize, cols: usize) -> Frame {
-        let window = status::foreground_name(self.master.as_fd()).unwrap_or_else(|| self.default_window.clone());
-        // Like tmux, the pane title defaults to the hostname.
-        let title = if self.screen.title.is_empty() { &self.hostname } else { &self.screen.title };
-        Frame::compose(&self.screen, rows, cols, status::line(&self.name, &window, title, cols))
+        Frame::compose(&self.screen, rows, cols)
     }
 
-    /// Fits the pane to a client terminal, minus the status line.
+    /// Fits the pane to a client terminal: the pane is the whole terminal.
     fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
-        let rows = rows.saturating_sub(1).max(1);
         self.screen.resize(rows.into(), cols.into());
         pty::set_winsize(self.master.as_fd(), &pty::winsize(rows, cols))
     }

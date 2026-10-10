@@ -132,7 +132,7 @@ to rewriting each changed row.
 
 ## Known gaps
 
-- One window and one pane (milestone 5).
+- One window and one pane. (Milestone 5 removes the status line rather than adding splits.)
 - A slow or stopped client blocks the server.
 - A client bigger than the pane shows blank space. A smaller one is
   clipped. tmux draws the unused area with dots and offers `window-size`.

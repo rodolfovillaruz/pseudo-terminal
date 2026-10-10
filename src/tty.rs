@@ -16,8 +16,6 @@ use crate::vt::{self, Cell, Color, Pen, Screen};
 /// Everything a client's terminal should show at one moment.
 pub struct Frame {
     pub cells: Vec<Vec<Cell>>,
-    /// Rows `0..pane_rows` hold the pane and may be scrolled as a block.
-    pub pane_rows: usize,
     pub cursor: (usize, usize),
     pub cursor_visible: bool,
     pub modes: BTreeSet<u16>,
@@ -26,13 +24,12 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// The pane in the top-left corner of a `rows` x `cols` terminal, with
-    /// `status` as the last row. A pane bigger than the terminal (another
-    /// client set its size) is clipped.
-    pub fn compose(screen: &Screen, rows: usize, cols: usize, status: Vec<Cell>) -> Frame {
-        let pane_rows = rows.saturating_sub(1).max(1).min(rows);
+    /// The pane in the top-left corner of a `rows` x `cols` terminal. A
+    /// pane bigger than the terminal (another client set its size) is
+    /// clipped; a smaller one leaves blank space.
+    pub fn compose(screen: &Screen, rows: usize, cols: usize) -> Frame {
         let mut cells = vec![vec![Cell::default(); cols]; rows];
-        for (r, line) in cells.iter_mut().enumerate().take(pane_rows.min(screen.rows)) {
+        for (r, line) in cells.iter_mut().enumerate().take(screen.rows) {
             let src = screen.row(r);
             let n = cols.min(screen.cols);
             line[..n].copy_from_slice(&src[..n]);
@@ -40,15 +37,9 @@ impl Frame {
                 line[n - 1] = Cell::default();
             }
         }
-        if rows > 1 {
-            let mut status = status;
-            status.resize(cols, Cell::default());
-            cells[rows - 1] = status;
-        }
         Frame {
             cells,
-            pane_rows,
-            cursor: (screen.cur.row.min(pane_rows - 1), screen.cur.col.min(cols.max(1) - 1)),
+            cursor: (screen.cur.row.min(rows.max(1) - 1), screen.cur.col.min(cols.max(1) - 1)),
             cursor_visible: screen.cursor_visible,
             modes: screen.private_modes.clone(),
             app_keypad: screen.app_keypad,
@@ -168,11 +159,11 @@ impl Tty {
     }
 
     /// If the pane's contents moved up by k lines (output scrolling), let the
-    /// terminal move them: set a scroll region over the pane so the status
-    /// line stays put, then SU. tmux does this in `tty_cmd_linefeed` /
-    /// `tty_cmd_scrollup`.
+    /// terminal move them with SU. The pane is the whole terminal, so no
+    /// scroll region is needed. tmux does this in `tty_cmd_linefeed` /
+    /// `tty_cmd_scrollup`, with a region whenever the pane is smaller.
     fn scroll(&mut self, o: &mut String, f: &Frame) {
-        let n = f.pane_rows.min(self.rows);
+        let n = self.rows;
         if n < 2 || self.front[0] == f.cells[0] {
             return;
         }
@@ -194,7 +185,7 @@ impl Tty {
             o.push_str("\x1b[0m");
             self.pen = Pen::default();
         }
-        let _ = write!(o, "\x1b[1;{n}r\x1b[{k}S\x1b[r");
+        let _ = write!(o, "\x1b[{k}S");
         self.front[..n].rotate_left(k);
         for line in &mut self.front[n - k..n] {
             line.fill(Cell::default());
@@ -290,17 +281,12 @@ mod tests {
     use super::*;
     use crate::vt::Parser;
 
-    fn status(text: &str) -> Vec<Cell> {
-        let pen = Pen { fg: Color::Indexed(0), bg: Color::Indexed(2), flags: 0 };
-        text.chars().map(|ch| Cell { ch, pen, width: 1 }).collect()
-    }
-
     /// Feeds `chunks` to a pane one at a time, drawing a frame after each,
     /// and checks that a terminal receiving only the draw output (modelled
     /// by our own `Screen`) shows exactly each frame. Returns what was sent
     /// for each frame.
     fn simulate(rows: usize, cols: usize, chunks: &[&[u8]]) -> Vec<String> {
-        let mut pane = Screen::new(rows - 1, cols);
+        let mut pane = Screen::new(rows, cols);
         let mut pane_parser = Parser::default();
         let mut term = Screen::new(rows, cols);
         let mut term_parser = Parser::default();
@@ -310,7 +296,7 @@ mod tests {
         let mut outs = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
             pane_parser.advance(&mut pane, chunk);
-            let frame = Frame::compose(&pane, rows, cols, status(&format!("[t] frame {i}")));
+            let frame = Frame::compose(&pane, rows, cols);
             let out = tty.draw(&frame);
             outs.push(String::from_utf8(out.clone()).unwrap());
             term_parser.advance(&mut term, &out);
@@ -343,46 +329,46 @@ mod tests {
         let lines: Vec<Vec<u8>> = (1..=30).map(|i| format!("line number {i}\r\n").into_bytes()).collect();
         let chunks: Vec<&[u8]> = lines.iter().map(|l| &l[..]).collect();
         let outs = simulate(10, 30, &chunks);
-        // Once the pane is full, each new line is one scroll of the pane
-        // region plus one short row, not a redraw of all nine rows.
-        let full_redraw = (1..=9).map(|r| format!("\x1b[{r};1Hline number 99").len()).sum::<usize>();
+        // Once the pane is full, each new line is one scroll plus one short
+        // row, not a redraw of all ten rows.
+        let full_redraw = (1..=10).map(|r| format!("\x1b[{r};1Hline number 99").len()).sum::<usize>();
         for out in &outs[20..] {
-            assert!(out.contains("\x1b[1;9r\x1b[1S\x1b[r"), "{out:?}");
+            assert!(out.contains("\x1b[1S") && !out.contains("\x1b[r"), "{out:?}");
             assert!(out.len() < full_redraw / 2, "{} bytes: {out:?}", out.len());
         }
     }
 
     #[test]
     fn unchanged_frame_sends_nothing() {
-        let mut pane = Screen::new(3, 10);
+        let mut pane = Screen::new(4, 10);
         Parser::default().advance(&mut pane, b"hello");
         let mut tty = Tty::new(4, 10);
         tty.start();
-        let frame = Frame::compose(&pane, 4, 10, status("s"));
+        let frame = Frame::compose(&pane, 4, 10);
         assert!(!tty.draw(&frame).is_empty());
         assert!(tty.draw(&frame).is_empty());
     }
 
     #[test]
     fn resize_redraws_everything() {
-        let mut pane = Screen::new(3, 10);
+        let mut pane = Screen::new(4, 10);
         Parser::default().advance(&mut pane, b"hello");
         let mut tty = Tty::new(4, 10);
         tty.start();
-        tty.draw(&Frame::compose(&pane, 4, 10, status("s")));
+        tty.draw(&Frame::compose(&pane, 4, 10));
         tty.resize(5, 12);
-        pane.resize(4, 12);
-        let out = String::from_utf8(tty.draw(&Frame::compose(&pane, 5, 12, status("s")))).unwrap();
+        pane.resize(5, 12);
+        let out = String::from_utf8(tty.draw(&Frame::compose(&pane, 5, 12))).unwrap();
         assert!(out.contains("\x1b[2J") && out.contains("hello"), "{out:?}");
     }
 
     #[test]
     fn stop_undoes_modes() {
-        let mut pane = Screen::new(3, 10);
+        let mut pane = Screen::new(4, 10);
         Parser::default().advance(&mut pane, b"\x1b[?1000;2004h\x1b=");
         let mut tty = Tty::new(4, 10);
         tty.start();
-        tty.draw(&Frame::compose(&pane, 4, 10, status("s")));
+        tty.draw(&Frame::compose(&pane, 4, 10));
         let out = String::from_utf8(tty.stop()).unwrap();
         for seq in ["\x1b[?1000l", "\x1b[?2004l", "\x1b>", "\x1b[?7h", "\x1b[?1049l"] {
             assert!(out.contains(seq), "missing {seq:?} in {out:?}");

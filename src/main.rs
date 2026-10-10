@@ -3,7 +3,6 @@ mod proto;
 mod pty;
 mod server;
 mod session;
-mod status;
 mod term;
 mod tty;
 mod vt;
